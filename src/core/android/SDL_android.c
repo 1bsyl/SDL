@@ -465,7 +465,9 @@ typedef enum {
 // onDestroy / inverse of nativeSetupJNI
 //    RPC_cmd_nativeQuit,
     RPC_cmd_nativePause,
+    RPC_cmd_nativePause_CancelSem,
     RPC_cmd_nativeResume,
+    RPC_cmd_nativeResume_CancelSem,
     RPC_cmd_WakeUp,
     RPC_cmd_nativeFocusChanged,
 // there are not returned void and so, they cannot really be defered to C Thread:
@@ -542,7 +544,9 @@ static const char *cmd2Str(RPC_cmd_t cmd) {
     CASE(onNativeDarkModeChanged);
     CASE(nativeSendQuit);
     CASE(nativePause);
+    CASE(nativePause_CancelSem);
     CASE(nativeResume);
+    CASE(nativeResume_CancelSem);
     CASE(WakeUp);
     CASE(nativeFocusChanged);
     CASE(nativeSetNaturalOrientation);
@@ -581,9 +585,14 @@ static const char *cmd2Str(RPC_cmd_t cmd) {
 
 
 // RPC TODO: enable timestamp ?
-#define RPC_Send                                \
-    /* data.timestamp = SDL_GetTicks(); */      \
-    RPC_Send__(&data, data.cmd, sizeof(data));            \
+#define RPC_Send                                                \
+    /* data.timestamp = SDL_GetTicks(); */                      \
+    RPC_Send__(&data, data.cmd, sizeof(data), false);           \
+
+#define RPC_SendWithPriority                                            \
+    /* data.timestamp = SDL_GetTicks(); */                              \
+    ret_send = RPC_Send__(&data, data.cmd, sizeof(data), true);         \
+
 
 #define RPC_Add(foo)    data.foo = foo;
 
@@ -600,9 +609,14 @@ static const char *cmd2Str(RPC_cmd_t cmd) {
     RPC_data_t data;                    \
     data.cmd = RPC_cmd_##foo;           \
     data.timestamp = SDL_GetTicks();    \
-    RPC_Send__(&data, data.cmd, sizeof(data));    \
+    RPC_Send__(&data, data.cmd, sizeof(data), false); \
 
-static void RPC_Send__(void *data, RPC_cmd_t cmd, int len);
+#define RPC_SendWithPriorityWithoutData(foo)                            \
+    data.cmd = RPC_cmd_##foo;                                           \
+    data.timestamp = SDL_GetTicks();                                    \
+    ret_send = RPC_Send__(&data, data.cmd, sizeof(data), true);         \
+
+static bool RPC_Send__(void *data, RPC_cmd_t cmd, int len, bool priority);
 static void RPC_Init();
 
 // header for command without data needed
@@ -1775,11 +1789,16 @@ JNIEXPORT void JNICALL SDL_JAVA_INTERFACE(nativePause)(
 {
     __android_log_print(ANDROID_LOG_VERBOSE, "SDL", "nativePause()");
 
-    RPC_SendWithoutData(nativePause);
+    bool ret_send;
+    RPC_data_t data;
+    RPC_SendWithPriorityWithoutData(nativePause);
 
     // Wait for completion
-    if (!SDL_WaitSemaphoreTimeoutNS(Android_PauseSem, -1)) {
-        SDL_Log("nativePause timeout expired");
+    if (ret_send) {
+        if (!SDL_WaitSemaphoreTimeoutNS(Android_PauseSem, SDL_MS_TO_NS(500))) {
+            SDL_Log("nativePause timeout expired");
+            RPC_SendWithPriorityWithoutData(nativePause_CancelSem);
+        }
     }
 }
 
@@ -1791,7 +1810,9 @@ JNIEXPORT void JNICALL SDL_JAVA_INTERFACE(nativeResume)(
 
     // First: send the resume CMD.
 
-    RPC_SendWithoutData(nativeResume);
+    bool ret_send;
+    RPC_data_t data;
+    RPC_SendWithPriorityWithoutData(nativeResume);
 
     // Un-block main C thread.
     SDL_SignalSemaphore(Android_BlockOnPauseSem);
@@ -1799,8 +1820,11 @@ JNIEXPORT void JNICALL SDL_JAVA_INTERFACE(nativeResume)(
     // It will consume the Resume CMD and get out of the PAUSE
 
     // Wait for completion
-    if (!SDL_WaitSemaphoreTimeoutNS(Android_ResumeSem, -1)) {
-        SDL_Log("nativeResume timeout expired");
+    if (ret_send) {
+        if (!SDL_WaitSemaphoreTimeoutNS(Android_ResumeSem, SDL_MS_TO_NS(500))) {
+            SDL_Log("nativeResume timeout expired");
+            RPC_SendWithPriorityWithoutData(nativeResume_CancelSem);
+        }
     }
     __android_log_print(ANDROID_LOG_VERBOSE, "SDL", "nativeResume() done");
 }
@@ -3227,8 +3251,10 @@ bool Android_JNI_OpenFileDialog(
 
 
 #define RPC_PAGE_SIZE (1024 * 10)
-static char RPC_cmd_buffer_0[RPC_PAGE_SIZE];
-static char RPC_cmd_buffer_1[RPC_PAGE_SIZE];
+// more size reserved for commands that should not be dropped
+#define RPC_PAGE_SIZE_RESERVED (1024 * 1)
+static char RPC_cmd_buffer_0[RPC_PAGE_SIZE + RPC_PAGE_SIZE_RESERVED];
+static char RPC_cmd_buffer_1[RPC_PAGE_SIZE + RPC_PAGE_SIZE_RESERVED];
 
 static char *RPC_cmd_buffer = NULL;  // RPC_cmd_buffer_0 or RPC_cmd_buffer_1
 static int  RPC_cur_cmd_buffer = 0;  // 0 or 1
@@ -3255,11 +3281,14 @@ static void RPC_Init()
 
 }
 
-static void RPC_Send__(void *data, RPC_cmd_t cmd, int len)
+static bool RPC_Send__(void *data, RPC_cmd_t cmd, int len, bool priority)
 {
+    bool ret = true;
     SDL_LockMutex(RPC_Mutex);
 
-    if (RPC_cur_size + len < RPC_PAGE_SIZE) {
+    int max_size = (priority ? RPC_PAGE_SIZE + RPC_PAGE_SIZE_RESERVED : RPC_PAGE_SIZE);
+
+    if (RPC_cur_size + len < max_size) {
         SDL_memcpy(RPC_cmd_buffer + RPC_cur_size, data, len);
         RPC_cur_size += len;
         RPC_cur_nb_cmd += 1;
@@ -3272,9 +3301,11 @@ static void RPC_Send__(void *data, RPC_cmd_t cmd, int len)
 #else
         __android_log_print(ANDROID_LOG_ERROR, "SDL", "cannot add RPC of len %d, cmd=%d", len, cmd);
 #endif
+        ret = false;
     }
 
     SDL_UnlockMutex(RPC_Mutex);
+    return ret;
 }
 
 void Android_LockActivityState(void)
@@ -3409,6 +3440,15 @@ void Android_PumpRPC(SDL_Window *window)
                 }
                 break;
 
+                // Cancel semaphore if timeout expired
+            case RPC_cmd_nativePause_CancelSem:
+                {
+                    RPC_GetNoData;
+
+                    SDL_TryWaitSemaphore(Android_PauseSem);
+                }
+                break;
+
             case RPC_cmd_nativeResume:
                 {
                     RPC_GetNoData;
@@ -3417,6 +3457,16 @@ void Android_PumpRPC(SDL_Window *window)
                     SDL_SignalSemaphore(Android_ResumeSem);
                 }
                 break;
+
+                // Cancel semaphore if timeout expired
+            case RPC_cmd_nativeResume_CancelSem:
+                {
+                    RPC_GetNoData;
+
+                    SDL_TryWaitSemaphore(Android_ResumeSem);
+                }
+                break;
+
 
             case RPC_cmd_WakeUp:
                 {
