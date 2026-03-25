@@ -611,10 +611,14 @@ static const char *cmd2Str(RPC_cmd_t cmd) {
     data.timestamp = SDL_GetTicks();    \
     RPC_Send__(&data, data.cmd, sizeof(data), false); \
 
+// returning value
 #define RPC_SendWithPriorityWithoutData(foo)                            \
-    data.cmd = RPC_cmd_##foo;                                           \
-    data.timestamp = SDL_GetTicks();                                    \
-    ret_send = RPC_Send__(&data, data.cmd, sizeof(data), true);         \
+    ({                                                                  \
+        RPC_data_t data;                                                \
+        data.cmd = RPC_cmd_##foo;                                       \
+        data.timestamp = SDL_GetTicks();                                \
+        RPC_Send__(&data, data.cmd, sizeof(data), true);                \
+    })                                                                  \
 
 static bool RPC_Send__(void *data, RPC_cmd_t cmd, int len, bool priority);
 static void RPC_Init();
@@ -1789,12 +1793,10 @@ JNIEXPORT void JNICALL SDL_JAVA_INTERFACE(nativePause)(
 {
     __android_log_print(ANDROID_LOG_VERBOSE, "SDL", "nativePause()");
 
-    bool ret_send;
-    RPC_data_t data;
-    RPC_SendWithPriorityWithoutData(nativePause);
+    bool ret = RPC_SendWithPriorityWithoutData(nativePause);
 
     // Wait for completion
-    if (ret_send) {
+    if (ret) {
         if (!SDL_WaitSemaphoreTimeoutNS(Android_PauseSem, SDL_MS_TO_NS(500))) {
             SDL_Log("nativePause timeout expired");
             RPC_SendWithPriorityWithoutData(nativePause_CancelSem);
@@ -1810,9 +1812,7 @@ JNIEXPORT void JNICALL SDL_JAVA_INTERFACE(nativeResume)(
 
     // First: send the resume CMD.
 
-    bool ret_send;
-    RPC_data_t data;
-    RPC_SendWithPriorityWithoutData(nativeResume);
+    bool ret = RPC_SendWithPriorityWithoutData(nativeResume);
 
     // Un-block main C thread.
     SDL_SignalSemaphore(Android_BlockOnPauseSem);
@@ -1820,7 +1820,7 @@ JNIEXPORT void JNICALL SDL_JAVA_INTERFACE(nativeResume)(
     // It will consume the Resume CMD and get out of the PAUSE
 
     // Wait for completion
-    if (ret_send) {
+    if (ret) {
         if (!SDL_WaitSemaphoreTimeoutNS(Android_ResumeSem, SDL_MS_TO_NS(500))) {
             SDL_Log("nativeResume timeout expired");
             RPC_SendWithPriorityWithoutData(nativeResume_CancelSem);
